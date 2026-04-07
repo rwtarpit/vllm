@@ -92,52 +92,45 @@ def pick_silu_mul_block_quant_fp8_config(
 
 
 @register_kernel(
+    mutates_args=["out", "scales"],
     config_picker=pick_silu_mul_block_quant_fp8_config,
     input_generator=generate_silu_mul_block_quant_fp8_inputs,
 )
 def silu_mul_block_quant_fp8(
-    input: torch.Tensor,
+    input: torch.Tensor,  # [num_tokens, 2 * hidden_size]
+    out: torch.Tensor,  # [num_tokens, hidden_size]
+    scales: torch.Tensor,  # [num_tokens, hidden_size // block_size]
+    block_size: torch.Tensor,
     scale_ub: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
 ) -> torch.Tensor:
+    # This code assumes batch_dim and num_tokens are flattened
     """
-    Helion kernel for blockwise quantized SiLU + mul fused kernel.
+    fused SiLU + mul fp8 quantized kernel
     """
+    assert block_size.numel() == 1 and block_size[0].dtype == torch.int32
+    group_size = block_size[0]
+    assert group_size == 128
+    assert input.is_contiguous() and input.ndim == 2
+    assert scales.is_contiguous() and scales.dtype == torch.float32
+    assert out.is_contiguous() and out.dtype == torch.float8_e4m3fn
+
     original_shape = input.shape
     two_d = hl.specialize(original_shape[-1])
     d = two_d // 2
     output_shape = original_shape[:-1] + (d,)
 
     input_2d = input.view(-1, original_shape[-1])
-    m = input_2d.shape[0]
 
-    # block sizes
-    block_m = hl.register_block_size(m)
-    block_d = hl.register_block_size(d)
-
-    # scale_out tensor sizes
-    scale_m = hl.cdiv(m, block_m)
-    scale_d = hl.cdiv(d, block_d)
-
-    out = torch.empty((m, d), device=input.device, dtype=torch.float8_e4m3fn)
     min_scaling_factor = 1 / (torch.finfo(torch.float8_e4m3fn).max * 512.0)
-
-    if is_scale_transposed:
-        scale_out = torch.empty(
-            (scale_d, scale_m), device=input.device, dtype=torch.float32
-        )
-    else:
-        scale_out = torch.empty(
-            (scale_m, scale_d), device=input.device, dtype=torch.float32
-        )
 
     input_part_a = input_2d[:, :d]
     input_part_b = input_2d[:, d:]
 
-    for tile_m, tile_n in hl.tile([m, d], block_size=[block_m, block_d]):
-        a_vals = input_part_a[tile_m, tile_n]
+    for tile_m, tile_d in hl.tile([1, d], block_size=group_size):
+        a_vals = input_part_a[tile_m, tile_d]
         silu_result = torch.nn.functional.silu(a_vals)
-        b_vals = input_part_b[tile_m, tile_n]
+        b_vals = input_part_b[tile_m, tile_d]
         result = silu_result * b_vals
         result_f32 = result.to(torch.float32)
 
@@ -150,18 +143,14 @@ def silu_mul_block_quant_fp8(
         block_scale = torch.max(block_scale, min_scaling_factor)
         inv_block_scale = 1.0 / block_scale
 
-        out[tile_m, tile_n] = (result_f32 * inv_block_scale).to(torch.float8_e4m3fn)
+        out[tile_m, tile_d] = (result_f32 * inv_block_scale).to(torch.float8_e4m3fn)
 
         if is_scale_transposed:
-            scale_out[tile_n.begin // block_d, tile_m.begin // block_m] = (
-                inv_block_scale
-            )
+            scales[tile_d.begin // group_size, tile_m] = inv_block_scale
         else:
-            scale_out[tile_m.begin // block_m, tile_n.begin // block_d] = (
-                inv_block_scale
-            )
+            scales[tile_m, tile_d.begin // group_size] = inv_block_scale
 
-    return out.view(output_shape), scale_out
+    return out.view(output_shape), scales
 
 
 def silu_mul_block_quant_fp8_baseline(
