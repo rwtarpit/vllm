@@ -186,12 +186,11 @@ class TestSiluMulBlockQuantFp8Correctness:
     @pytest.mark.parametrize("batch_size", [1, 8, 32, 128])
     @pytest.mark.parametrize("intermediate_size", [2048, 3000, 3500, 4096, 5000])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    @pytest.mark.parametrize("block_size", [128, 256])
     def test_silu_mul_block_quant_fp8_correctness(
-        self, batch_size, intermediate_size, dtype, block_size
+        self, batch_size, intermediate_size, dtype
     ):
         skip_if_platform_unsupported()
-
+        block_size = 128
         input_size = 2 * intermediate_size
         input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device="cuda")
 
@@ -317,8 +316,7 @@ class TestSiluMulBlockQuantFp8Correctness:
 
 def silu_mul_block_quant_fp8_pytorch(
     input: torch.Tensor,
-    block_m: int = 128,
-    block_d: int = 128,
+    block_size: int = 128,
     scale_ub: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -327,9 +325,15 @@ def silu_mul_block_quant_fp8_pytorch(
     Mirrors the Helion kernel logic exactly so we can compare with tighter
     tolerances than when comparing against the C++ baseline (which uses
     hardware FP8 rounding).
+
+    Note: block_m and block_d are both fixed to block_size (128) to match
+    the kernel's hardcoded group_size assertion.
     """
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     min_scaling_factor = 1.0 / (fp8_max * 512.0)
+
+    block_m = block_size
+    block_d = block_size
 
     d = input.shape[-1] // 2
     input_2d = input.view(-1, input.shape[-1])
