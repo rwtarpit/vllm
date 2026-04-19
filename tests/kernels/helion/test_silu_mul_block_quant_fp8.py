@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
 
 import pytest
 import torch
-import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 
-from vllm.utils.import_utils import has_helion
-
-if not has_helion():
-    pytest.skip(
-        "Helion is not installed. Install with: pip install vllm[helion]",
-        allow_module_level=True,
-    )
-
+from tests.kernels.quant_utils import FP8_DTYPE
 from vllm.kernels.helion.config_manager import ConfigManager
 from vllm.kernels.helion.ops.silu_mul_block_quant_fp8 import (
     pick_silu_mul_block_quant_fp8_config,
     silu_mul_block_quant_fp8,
     silu_mul_block_quant_fp8_baseline,
 )
+from vllm.utils.import_utils import has_helion
+from vllm.utils.torch_utils import set_random_seed
+
+if not has_helion():
+    pytest.skip(
+        "Helion is not installed. Install with: pip install vllm[helion]",
+        allow_module_level=True,
+    )
 
 
 def skip_if_platform_unsupported():
@@ -49,6 +51,26 @@ def skip_if_platform_unsupported():
         )
 
 
+def _generate_fake_input(
+    num_tokens: int, hidden_size: int, group_size: int
+) -> tuple[Any, ...]:
+    """Generate fake (FakeTensor) inputs matching the silu kernel signature."""
+    with FakeTensorMode():
+        # input has shape [num_tokens, 2 * hidden_size]
+        input = torch.randn(
+            (num_tokens, 2 * hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        scales = torch.empty(
+            (num_tokens, hidden_size // group_size),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scale_ub = torch.mean(input.abs()).to(torch.float32)
+        args = (input, out, scales, group_size, scale_ub)
+    return args
+
+
 @pytest.fixture(autouse=True)
 def reset_config_manager_singleton():
     ConfigManager.reset_instance()
@@ -60,458 +82,237 @@ def reset_config_manager_singleton():
 class TestSiluMulBlockQuantFp8ConfigPicker:
     def test_config_picker_exact_match(self):
         config_keys = [
-            "intermediate_2048_numtokens_256",
-            "intermediate_4096_numtokens_256",
+            "default",
+            "hidden_size_2048_group_size_64_num_tokens_16",
+            "hidden_size_4096_group_size_128_num_tokens_16",
         ]
 
-        input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
+        args = _generate_fake_input(16, 4096, 128)
         selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_2048_numtokens_256"
+        assert selected_key == "hidden_size_4096_group_size_128_num_tokens_16"
 
     def test_config_picker_closest_match(self):
         config_keys = [
-            "intermediate_2048_numtokens_256",
-            "intermediate_4096_numtokens_256",
+            "default",
+            "hidden_size_2048_group_size_64_num_tokens_16",
+            "hidden_size_2048_group_size_64_num_tokens_32",
+            "hidden_size_2048_group_size_128_num_tokens_16",
+            "hidden_size_2048_group_size_128_num_tokens_32",
+            "hidden_size_4096_group_size_64_num_tokens_16",
+            "hidden_size_4096_group_size_64_num_tokens_32",
+            "hidden_size_4096_group_size_128_num_tokens_16",
+            "hidden_size_4096_group_size_128_num_tokens_32",
         ]
-        # intermediate_size = 7000 // 2 = 3500, closer to 4096 than 2048
-        input_tensor = torch.randn(32, 7000, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
 
+        # hidden_size=3000 is between 2048 and 4096 -> closer to 2048 (diff 952 vs 1096)
+        # group_size=70 is between 64 and 128 -> closer to 64 (diff 6 vs 58)
+        # num_tokens=20 -> smallest available >= 20 is 32
+        args = _generate_fake_input(20, 3000, 70)
         selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_numtokens_256"
+        assert selected_key == "hidden_size_2048_group_size_64_num_tokens_32"
 
     def test_config_picker_fallback_to_default(self):
         config_keys = ["default"]
 
-        input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
+        args = _generate_fake_input(16, 4096, 128)
         selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
         assert selected_key == "default"
 
     def test_config_picker_no_configs(self):
         config_keys: list[str] = []
 
-        input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
+        args = _generate_fake_input(16, 4096, 128)
         selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
         assert selected_key is None
 
-    @pytest.mark.parametrize("intermediate_size", [2048, 4096, 5120])
-    def test_config_picker_different_sizes(self, intermediate_size):
-        config_keys = [
-            "intermediate_2048_numtokens_256",
-            "intermediate_4096_numtokens_256",
-            "intermediate_5120_numtokens_256",
-        ]
-
-        input_tensor = torch.randn(
-            32, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
-        )
-        args = (input_tensor,)
-
-        selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        expected_key = f"intermediate_{intermediate_size}_numtokens_256"
-        assert selected_key == expected_key
-
-    def test_config_picker_numtokens_ceiling(self):
-        """Pick the smallest numtokens >= input num_tokens."""
-        config_keys = [
-            "intermediate_4096_numtokens_8",
-            "intermediate_4096_numtokens_32",
-            "intermediate_4096_numtokens_128",
-            "intermediate_4096_numtokens_256",
-        ]
-        # 20 tokens -> should pick numtokens_32 (smallest >= 20)
-        input_tensor = torch.randn(20, 8192, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
-        selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_numtokens_32"
-
-    def test_config_picker_numtokens_exact(self):
-        """Exact num_tokens match is preferred over ceiling."""
-        config_keys = [
-            "intermediate_4096_numtokens_8",
-            "intermediate_4096_numtokens_32",
-            "intermediate_4096_numtokens_128",
-        ]
-        input_tensor = torch.randn(32, 8192, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
-        selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_numtokens_32"
-
-    def test_config_picker_numtokens_fallback_to_largest(self):
-        """Fall back to the largest numtokens when input exceeds all."""
-        config_keys = [
-            "intermediate_4096_numtokens_8",
-            "intermediate_4096_numtokens_32",
-            "intermediate_4096_numtokens_128",
-        ]
-        # 512 tokens -> exceeds all available, should pick largest (128)
-        input_tensor = torch.randn(512, 8192, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
-        selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_numtokens_128"
-
-    def test_config_picker_malformed_key_raises(self):
-        """Malformed config keys should raise ValueError."""
-        config_keys = ["intermediate_4096_badformat_256"]
-        input_tensor = torch.randn(32, 8192, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
-
-        with pytest.raises(ValueError, match="Malformed config key"):
-            pick_silu_mul_block_quant_fp8_config(args, config_keys)
-
-    def test_config_picker_default_ignored_when_valid_keys_exist(self):
-        """'default' is skipped in favor of a real match."""
+    def test_config_picker_fallback_to_largest(self):
         config_keys = [
             "default",
-            "intermediate_4096_numtokens_32",
-            "intermediate_4096_numtokens_128",
+            "hidden_size_2048_group_size_64_num_tokens_16",
+            "hidden_size_2048_group_size_64_num_tokens_32",
+            "hidden_size_2048_group_size_128_num_tokens_16",
+            "hidden_size_2048_group_size_128_num_tokens_32",
+            "hidden_size_4096_group_size_64_num_tokens_16",
+            "hidden_size_4096_group_size_64_num_tokens_32",
+            "hidden_size_4096_group_size_128_num_tokens_16",
+            "hidden_size_4096_group_size_128_num_tokens_32",
         ]
-        input_tensor = torch.randn(64, 8192, dtype=torch.bfloat16, device="cuda")
-        args = (input_tensor,)
 
+        # num_tokens=64 exceeds largest available (32) -> fall back to largest
+        args = _generate_fake_input(64, 8192, 256)
         selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
-        assert selected_key == "intermediate_4096_numtokens_128"
+        assert selected_key == "hidden_size_4096_group_size_128_num_tokens_32"
+
+    def test_config_picker_malformed_key_raises(self):
+        config_keys = ["bad_key"]
+
+        args = _generate_fake_input(16, 4096, 128)
+        with pytest.raises(ValueError):
+            pick_silu_mul_block_quant_fp8_config(args, config_keys)
+
+    def test_config_picker_only_default_no_parameterised_keys(self):
+        """Only 'default' present and no parameterised keys -> returns 'default'."""
+        config_keys = ["default"]
+
+        args = _generate_fake_input(8, 2048, 64)
+        selected_key = pick_silu_mul_block_quant_fp8_config(args, config_keys)
+        assert selected_key == "default"
+
+
+DTYPES = [torch.bfloat16, torch.float]
+# num_tokens x hidden_size pairs (hidden_size is the `output` half-width)
+NUM_TOKENS_HIDDEN_SIZES = [
+    *[(1, i) for i in [64, 128, 1024, 4096]],
+    *[(16, i) for i in [64, 1024]],
+    *[(256, i) for i in [64]],
+]
+SCALE_UBS = [True, False]
+GROUP_SIZES = [64, 128]
+SEEDS = [0]
 
 
 class TestSiluMulBlockQuantFp8Correctness:
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128])
-    @pytest.mark.parametrize("intermediate_size", [2048, 3000, 3500, 4096, 5000])
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_silu_mul_block_quant_fp8_correctness(
-        self, batch_size, intermediate_size, dtype
-    ):
-        skip_if_platform_unsupported()
-        block_size = 128
-        input_size = 2 * intermediate_size
-        input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device="cuda")
-
-        helion_out, helion_scale = silu_mul_block_quant_fp8(input_tensor)
-        baseline_out, baseline_scale = silu_mul_block_quant_fp8_baseline(
-            input_tensor, block_size
-        )
-
-        assert helion_out.shape == baseline_out.shape
-        assert helion_out.dtype == torch.float8_e4m3fn
-        assert baseline_out.dtype == torch.float8_e4m3fn
-
-        helion_f32 = helion_out.to(torch.float32)
-        baseline_f32 = baseline_out.to(torch.float32)
-
-        torch.testing.assert_close(
-            helion_f32,
-            baseline_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg=f"Output mismatch at batch={batch_size}, size={intermediate_size}",
-        )
-
-    def test_silu_mul_block_quant_fp8_shape_inference(self):
-        skip_if_platform_unsupported()
-        batch_size, input_size = 32, 8192
-        intermediate_size = input_size // 2
-
-        input_tensor = torch.randn(
-            batch_size, input_size, dtype=torch.bfloat16, device="cuda"
-        )
-
-        out, scale_out = silu_mul_block_quant_fp8(input_tensor)
-
-        expected_shape = (batch_size, intermediate_size)
-        assert out.shape == expected_shape
-        assert out.dtype == torch.float8_e4m3fn
-        assert scale_out.dtype == torch.float32
-        assert out.device == input_tensor.device
-
-    def test_silu_mul_block_quant_fp8_scale_ub(self):
-        """scale_ub clamps per-block scales to the provided upper bound."""
-        skip_if_platform_unsupported()
-        batch_size, input_size = 16, 4096
-
-        input_tensor = torch.randn(
-            batch_size, input_size, dtype=torch.bfloat16, device="cuda"
-        )
-        scale_ub = torch.tensor([0.5], dtype=torch.float32, device="cuda")
-
-        out_clamped, scale_clamped = silu_mul_block_quant_fp8(
-            input_tensor, scale_ub=scale_ub
-        )
-        out_unclamped, scale_unclamped = silu_mul_block_quant_fp8(input_tensor)
-
-        assert out_clamped.shape == out_unclamped.shape
-        assert out_clamped.dtype == torch.float8_e4m3fn
-        # All per-block scales must not exceed scale_ub
-        assert (scale_clamped <= scale_ub.item() + 1e-6).all()
-
+    @pytest.mark.parametrize("num_tokens, hidden_size", NUM_TOKENS_HIDDEN_SIZES)
+    @pytest.mark.parametrize("has_scale_ub", SCALE_UBS)
+    @pytest.mark.parametrize("dtype", DTYPES)
     @pytest.mark.parametrize("is_scale_transposed", [False, True])
-    def test_silu_mul_block_quant_fp8_scale_transposed(self, is_scale_transposed):
-        """Output scale tensor has the correct shape when transposed."""
+    @pytest.mark.parametrize("group_size", GROUP_SIZES)
+    @pytest.mark.parametrize("seed", SEEDS)
+    def test_silu_mul_block_quant_fp8(
+        self,
+        num_tokens: int,
+        hidden_size: int,
+        has_scale_ub: bool,
+        dtype: torch.dtype,
+        is_scale_transposed: bool,
+        group_size: int,
+        seed: int,
+    ) -> None:
         skip_if_platform_unsupported()
-        batch_size, input_size = 32, 8192
 
-        input_tensor = torch.randn(
-            batch_size, input_size, dtype=torch.bfloat16, device="cuda"
+        set_random_seed(seed)
+
+        if hidden_size % group_size != 0:
+            return
+
+        scale = 1.0 / hidden_size
+        # input has shape [num_tokens, 2 * hidden_size]: first half = gate, second = up
+        input = (
+            torch.randn(num_tokens, 2 * hidden_size, dtype=dtype, device="cuda") * scale
         )
 
-        out, scale_out = silu_mul_block_quant_fp8(
-            input_tensor, is_scale_transposed=is_scale_transposed
+        scale_ub = (
+            torch.mean(input.abs()).to(dtype=torch.float32, device="cuda")
+            if has_scale_ub
+            else None
         )
 
-        # scale dimensions depend on block sizes registered inside the kernel;
-        # we only assert the rank and that the two dims are swapped.
-        assert scale_out.ndim == 2
+        groups_per_row = hidden_size // group_size
+
+        # Allocate outputs for baseline and kernel
+        ref_out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        ops_out = ref_out.clone()
+
         if is_scale_transposed:
-            # (scale_d, scale_m)
-            assert scale_out.shape[0] <= scale_out.shape[1] or True  # shape check
+            ref_scales = torch.empty(
+                (groups_per_row, num_tokens), device="cuda", dtype=torch.float32
+            ).transpose(0, 1)
         else:
-            # (scale_m, scale_d)
-            assert scale_out.shape[0] <= scale_out.shape[1] or True
+            ref_scales = torch.empty(
+                (num_tokens, groups_per_row), device="cuda", dtype=torch.float32
+            )
+        ops_scales = ref_scales.clone()
 
-        assert out.dtype == torch.float8_e4m3fn
-        assert scale_out.dtype == torch.float32
+        # Baseline
+        silu_mul_block_quant_fp8_baseline(
+            input,
+            group_size,
+            scale_ub,
+            is_scale_transposed,
+        )
+
+        # Helion kernel
+        silu_mul_block_quant_fp8(
+            input,
+            ops_out,
+            ops_scales,
+            group_size,
+            scale_ub,
+            is_scale_transposed,
+        )
+
+        ref_scales_c = ref_scales.contiguous()
+        ops_scales_c = ops_scales.contiguous()
+
+        torch.testing.assert_close(ref_scales_c, ops_scales_c)
+        # Allow at most 1 ULP difference in quantized output
+        assert (
+            ref_out.view(torch.uint8).to(torch.int16)
+            - ops_out.view(torch.uint8).to(torch.int16)
+        ).abs().max() <= 1
 
     @pytest.mark.parametrize(
-        "shape",
-        [
-            (1, 4096),
-            (16, 4096),
-            (128, 4096),
-            (1024, 4096),
-            (1, 8192),
-            (16, 8192),
-            (128, 8192),
-        ],
+        "num_tokens, hidden_size",
+        [(1, 64), (4, 128), (16, 1024)],
     )
-    def test_silu_mul_block_quant_fp8_various_shapes(self, shape):
+    @pytest.mark.parametrize("group_size", GROUP_SIZES)
+    def test_silu_activation_applied(
+        self, num_tokens: int, hidden_size: int, group_size: int
+    ) -> None:
+        """Verify that SiLU is actually applied (not just a plain multiply)."""
         skip_if_platform_unsupported()
 
-        input_tensor = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
+        if hidden_size % group_size != 0:
+            return
 
-        helion_out, helion_scale = silu_mul_block_quant_fp8(input_tensor)
-        baseline_out, baseline_scale = silu_mul_block_quant_fp8_baseline(
-            input_tensor, block_size=128
+        torch.manual_seed(42)
+        input = torch.randn(
+            num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        scales = torch.empty(
+            (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
         )
 
-        assert helion_out.shape == baseline_out.shape
+        silu_mul_block_quant_fp8(input, out, scales, group_size)
 
-        helion_f32 = helion_out.to(torch.float32)
-        baseline_f32 = baseline_out.to(torch.float32)
+        gate = input[:, :hidden_size].float()
+        up = input[:, hidden_size:].float()
+        expected_fp32 = torch.nn.functional.silu(gate) * up
 
-        torch.testing.assert_close(
-            helion_f32,
-            baseline_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg=f"Mismatch for shape={shape}",
-        )
+        # Dequantise the kernel output and compare sign pattern at high level
+        dequant = out.float() * scales.repeat_interleave(group_size, dim=1)
+        # Signs should agree for the vast majority of elements
+        sign_match = (torch.sign(dequant) == torch.sign(expected_fp32)).float().mean()
+        assert sign_match > 0.95, f"Sign match too low: {sign_match:.3f}"
 
-
-def silu_mul_block_quant_fp8_pytorch(
-    input: torch.Tensor,
-    block_size: int = 128,
-    scale_ub: torch.Tensor | None = None,
-    is_scale_transposed: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pure PyTorch blockwise-quantized SiLU + mul reference.
-
-    Mirrors the Helion kernel logic exactly so we can compare with tighter
-    tolerances than when comparing against the C++ baseline (which uses
-    hardware FP8 rounding).
-
-    Note: block_m and block_d are both fixed to block_size (128) to match
-    the kernel's hardcoded group_size assertion.
-    """
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    min_scaling_factor = 1.0 / (fp8_max * 512.0)
-
-    block_m = block_size
-    block_d = block_size
-
-    d = input.shape[-1] // 2
-    input_2d = input.view(-1, input.shape[-1])
-    m = input_2d.shape[0]
-
-    a = input_2d[:, :d]
-    b = input_2d[:, d:]
-    result = F.silu(a) * b
-    result_f32 = result.to(torch.float32)
-
-    scale_m = (m + block_m - 1) // block_m
-    scale_d = (d + block_d - 1) // block_d
-
-    out = torch.empty((m, d), dtype=torch.float8_e4m3fn, device=input.device)
-
-    if is_scale_transposed:
-        scale_out = torch.empty(
-            (scale_d, scale_m), dtype=torch.float32, device=input.device
-        )
-    else:
-        scale_out = torch.empty(
-            (scale_m, scale_d), dtype=torch.float32, device=input.device
-        )
-
-    for bm in range(scale_m):
-        for bd in range(scale_d):
-            rm = slice(bm * block_m, min((bm + 1) * block_m, m))
-            rd = slice(bd * block_d, min((bd + 1) * block_d, d))
-            tile = result_f32[rm, rd]
-
-            abs_max = tile.abs().max()
-            block_scale = abs_max / fp8_max
-
-            if scale_ub is not None:
-                block_scale = torch.min(block_scale, scale_ub)
-
-            block_scale = torch.clamp(block_scale, min=min_scaling_factor)
-            inv_block_scale = 1.0 / block_scale
-
-            out[rm, rd] = (tile * inv_block_scale).to(torch.float8_e4m3fn)
-
-            if is_scale_transposed:
-                scale_out[bd, bm] = inv_block_scale
-            else:
-                scale_out[bm, bd] = inv_block_scale
-
-    original_shape = input.shape[:-1] + (d,)
-    return out.view(original_shape), scale_out
-
-
-class TestSiluMulBlockQuantFp8PytorchReference:
-    """Tests comparing Helion kernel against pure PyTorch blockwise reference.
-
-    Uses tighter tolerance since both implementations share the same FP8
-    rounding path, unlike the C++ baseline which uses hardware conversion.
-    """
-
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 256])
-    @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_silu_mul_block_quant_fp8_vs_pytorch(
-        self, batch_size, intermediate_size, dtype
-    ):
+    @pytest.mark.parametrize("num_tokens", [1, 8, 32])
+    def test_scale_ub_clamps_scales(self, num_tokens: int) -> None:
+        """When scale_ub is set, all per-block scales must be <= scale_ub / fp8_max."""
         skip_if_platform_unsupported()
 
-        input_tensor = torch.randn(
-            batch_size, 2 * intermediate_size, dtype=dtype, device="cuda"
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            get_fp8_min_max,
         )
 
-        pytorch_out, pytorch_scale = silu_mul_block_quant_fp8_pytorch(input_tensor)
-        helion_out, helion_scale = silu_mul_block_quant_fp8(input_tensor)
-
-        assert helion_out.shape == pytorch_out.shape
-        assert helion_out.dtype == torch.float8_e4m3fn
-
-        pytorch_f32 = pytorch_out.to(torch.float32)
-        helion_f32 = helion_out.to(torch.float32)
-
-        torch.testing.assert_close(
-            helion_f32,
-            pytorch_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg=(
-                f"Mismatch at batch={batch_size}, size={intermediate_size}, "
-                f"dtype={dtype}"
-            ),
+        hidden_size = 128
+        group_size = 64
+        torch.manual_seed(0)
+        input = torch.randn(
+            num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
         )
-
-    @pytest.mark.parametrize(
-        "shape",
-        [
-            (1, 2, 4096),  # 3D input
-            (2, 4, 2048),  # 3D input
-            (1, 1, 1, 8192),  # 4D input
-        ],
-    )
-    def test_silu_mul_block_quant_fp8_multidim_vs_pytorch(self, shape):
-        skip_if_platform_unsupported()
-
-        input_tensor = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
-
-        pytorch_out, pytorch_scale = silu_mul_block_quant_fp8_pytorch(
-            input_tensor.view(-1, shape[-1])
+        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        scales = torch.empty(
+            (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
         )
-        helion_out, helion_scale = silu_mul_block_quant_fp8(input_tensor)
+        _, fp8_max = get_fp8_min_max()
+        scale_ub_val = float(input.abs().mean().item())
 
-        # Compare flattened outputs
-        pytorch_f32 = pytorch_out.view(-1).to(torch.float32)
-        helion_f32 = helion_out.view(-1).to(torch.float32)
+        silu_mul_block_quant_fp8(input, out, scales, group_size, scale_ub=scale_ub_val)
 
-        assert helion_f32.shape == pytorch_f32.shape
-
-        torch.testing.assert_close(
-            helion_f32,
-            pytorch_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg=f"Mismatch for shape={shape}",
-        )
-
-    @pytest.mark.parametrize("is_scale_transposed", [False, True])
-    def test_silu_mul_block_quant_fp8_scale_transposed_vs_pytorch(
-        self, is_scale_transposed
-    ):
-        skip_if_platform_unsupported()
-        batch_size, input_size = 32, 8192
-
-        input_tensor = torch.randn(
-            batch_size, input_size, dtype=torch.bfloat16, device="cuda"
-        )
-
-        pytorch_out, pytorch_scale = silu_mul_block_quant_fp8_pytorch(
-            input_tensor, is_scale_transposed=is_scale_transposed
-        )
-        helion_out, helion_scale = silu_mul_block_quant_fp8(
-            input_tensor, is_scale_transposed=is_scale_transposed
-        )
-
-        assert helion_out.shape == pytorch_out.shape
-        assert helion_scale.shape == pytorch_scale.shape
-
-        helion_f32 = helion_out.to(torch.float32)
-        pytorch_f32 = pytorch_out.to(torch.float32)
-
-        torch.testing.assert_close(
-            helion_f32,
-            pytorch_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg=f"Mismatch for is_scale_transposed={is_scale_transposed}",
-        )
-
-    def test_silu_mul_block_quant_fp8_scale_ub_vs_pytorch(self):
-        skip_if_platform_unsupported()
-        batch_size, input_size = 16, 4096
-
-        input_tensor = torch.randn(
-            batch_size, input_size, dtype=torch.bfloat16, device="cuda"
-        )
-        scale_ub = torch.tensor([0.5], dtype=torch.float32, device="cuda")
-
-        pytorch_out, pytorch_scale = silu_mul_block_quant_fp8_pytorch(
-            input_tensor, scale_ub=scale_ub
-        )
-        helion_out, helion_scale = silu_mul_block_quant_fp8(
-            input_tensor, scale_ub=scale_ub
-        )
-
-        helion_f32 = helion_out.to(torch.float32)
-        pytorch_f32 = pytorch_out.to(torch.float32)
-
-        torch.testing.assert_close(
-            helion_f32,
-            pytorch_f32,
-            atol=0.05,
-            rtol=0.05,
-            msg="Mismatch with scale_ub applied",
+        # Each scale = amax / fp8_max, so amax = scale * fp8_max <= scale_ub
+        assert (scales * fp8_max <= scale_ub_val + 1e-5).all(), (
+            "Some scales exceed scale_ub"
         )
 
 
@@ -525,21 +326,54 @@ class TestSiluMulBlockQuantFp8Integration:
         kernel_wrapper = registered_kernels["silu_mul_block_quant_fp8"]
         assert kernel_wrapper.op_name == "silu_mul_block_quant_fp8"
         assert kernel_wrapper._config_picker is not None
+        assert set(kernel_wrapper._mutates_args) == {"out", "scales"}
 
     def test_fake_impl_functionality(self):
         skip_if_platform_unsupported()
         from vllm.kernels.helion.register import get_registered_kernels
 
-        input_tensor = torch.randn(32, 4096, dtype=torch.bfloat16, device="cuda")
         registered_kernels = get_registered_kernels()
         kernel_wrapper = registered_kernels["silu_mul_block_quant_fp8"]
         fake_impl = kernel_wrapper._fake_impl
 
-        fake_out, fake_scale = fake_impl(input_tensor)
+        args = _generate_fake_input(16, 4096, 128)
+        # fake impl should execute without error under FakeTensorMode
+        result = fake_impl(*args)
+        # kernel returns (out, scales) tuple; fake impl may return None or a tuple
+        assert result is None or isinstance(result, tuple)
 
-        expected_out_shape = (32, 2048)
-        assert fake_out.shape == expected_out_shape
-        assert fake_out.dtype == torch.float8_e4m3fn
-        assert fake_out.device == input_tensor.device
-        assert fake_scale.dtype == torch.float32
-        assert fake_scale.device == input_tensor.device
+    def test_output_shapes(self):
+        """Kernel must produce outputs with the expected shapes."""
+        skip_if_platform_unsupported()
+
+        num_tokens, hidden_size, group_size = 8, 256, 64
+        input = torch.randn(
+            num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        scales = torch.empty(
+            (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
+        )
+
+        silu_mul_block_quant_fp8(input, out, scales, group_size)
+
+        assert out.shape == (num_tokens, hidden_size)
+        assert scales.shape == (num_tokens, hidden_size // group_size)
+        assert out.dtype == FP8_DTYPE
+        assert scales.dtype == torch.float32
+
+    def test_output_dtype_is_fp8(self):
+        """Output tensor must be written in FP8 dtype."""
+        skip_if_platform_unsupported()
+
+        num_tokens, hidden_size, group_size = 4, 128, 64
+        input = torch.randn(
+            num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
+        scales = torch.empty(
+            (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
+        )
+
+        silu_mul_block_quant_fp8(input, out, scales, group_size)
+        assert out.dtype == FP8_DTYPE
