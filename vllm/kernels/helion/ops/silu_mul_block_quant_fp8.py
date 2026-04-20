@@ -144,7 +144,7 @@ def silu_mul_block_quant_fp8(
 ) -> torch.Tensor:
     # This code assumes batch_dim and num_tokens are flattened
     group_size = hl.specialize(block_size)
-    assert group_size == 16
+    assert group_size == 64 or group_size == 128
     assert input.is_contiguous() and input.ndim == 2
     assert scales.is_contiguous() and scales.dtype == torch.float32
     fp8_dtype = _get_fp8_dtype()
