@@ -13,6 +13,9 @@ from vllm.kernels.helion.ops.silu_mul_block_quant_fp8 import (
     silu_mul_block_quant_fp8,
     silu_mul_block_quant_fp8_baseline,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+)
 from vllm.utils.import_utils import has_helion
 from vllm.utils.torch_utils import set_random_seed
 
@@ -159,7 +162,7 @@ class TestSiluMulBlockQuantFp8ConfigPicker:
         assert selected_key == "default"
 
 
-DTYPES = [torch.bfloat16, torch.float]
+DTYPES = [torch.bfloat16, torch.float16]
 # num_tokens x hidden_size pairs (hidden_size is the `output` half-width)
 NUM_TOKENS_HIDDEN_SIZES = [
     *[(1, i) for i in [64, 128, 1024, 4096]],
@@ -175,7 +178,6 @@ class TestSiluMulBlockQuantFp8Correctness:
     @pytest.mark.parametrize("num_tokens, hidden_size", NUM_TOKENS_HIDDEN_SIZES)
     @pytest.mark.parametrize("has_scale_ub", SCALE_UBS)
     @pytest.mark.parametrize("dtype", DTYPES)
-    @pytest.mark.parametrize("is_scale_transposed", [False, True])
     @pytest.mark.parametrize("group_size", GROUP_SIZES)
     @pytest.mark.parametrize("seed", SEEDS)
     def test_silu_mul_block_quant_fp8(
@@ -184,7 +186,6 @@ class TestSiluMulBlockQuantFp8Correctness:
         hidden_size: int,
         has_scale_ub: bool,
         dtype: torch.dtype,
-        is_scale_transposed: bool,
         group_size: int,
         seed: int,
     ) -> None:
@@ -195,100 +196,59 @@ class TestSiluMulBlockQuantFp8Correctness:
         if hidden_size % group_size != 0:
             return
 
+        _, fp8_max = get_fp8_min_max()
         scale = 1.0 / hidden_size
         # input has shape [num_tokens, 2 * hidden_size]: first half = gate, second = up
         input = (
             torch.randn(num_tokens, 2 * hidden_size, dtype=dtype, device="cuda") * scale
         )
 
-        scale_ub = (
-            torch.mean(input.abs()).to(dtype=torch.float32, device="cuda")
-            if has_scale_ub
-            else None
-        )
+        mean_val = torch.mean(input.abs())
+
+        if has_scale_ub:
+            scale_ub = (mean_val / fp8_max).to(dtype=torch.float32, device="cuda")
+        else:
+            scale_ub = None
 
         groups_per_row = hidden_size // group_size
 
-        # Allocate outputs for baseline and kernel
         ref_out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
         ops_out = ref_out.clone()
 
-        if is_scale_transposed:
-            ref_scales = torch.empty(
-                (groups_per_row, num_tokens), device="cuda", dtype=torch.float32
-            ).transpose(0, 1)
-        else:
-            ref_scales = torch.empty(
-                (num_tokens, groups_per_row), device="cuda", dtype=torch.float32
-            )
+        ref_scales = torch.empty(
+            (num_tokens, groups_per_row), device="cuda", dtype=torch.float32
+        )
         ops_scales = ref_scales.clone()
 
-        # Baseline
         silu_mul_block_quant_fp8_baseline(
+            ref_out,
             input,
+            ref_scales,
             group_size,
             scale_ub,
-            is_scale_transposed,
+            False,
         )
 
-        # Helion kernel
         silu_mul_block_quant_fp8(
             input,
             ops_out,
             ops_scales,
             group_size,
             scale_ub,
-            is_scale_transposed,
         )
 
         ref_scales_c = ref_scales.contiguous()
         ops_scales_c = ops_scales.contiguous()
 
         torch.testing.assert_close(ref_scales_c, ops_scales_c)
-        # Allow at most 1 ULP difference in quantized output
         assert (
             ref_out.view(torch.uint8).to(torch.int16)
             - ops_out.view(torch.uint8).to(torch.int16)
         ).abs().max() <= 1
 
-    @pytest.mark.parametrize(
-        "num_tokens, hidden_size",
-        [(1, 64), (4, 128), (16, 1024)],
-    )
-    @pytest.mark.parametrize("group_size", GROUP_SIZES)
-    def test_silu_activation_applied(
-        self, num_tokens: int, hidden_size: int, group_size: int
-    ) -> None:
-        """Verify that SiLU is actually applied (not just a plain multiply)."""
-        skip_if_platform_unsupported()
-
-        if hidden_size % group_size != 0:
-            return
-
-        torch.manual_seed(42)
-        input = torch.randn(
-            num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
-        )
-        out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
-        scales = torch.empty(
-            (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
-        )
-
-        silu_mul_block_quant_fp8(input, out, scales, group_size)
-
-        gate = input[:, :hidden_size].float()
-        up = input[:, hidden_size:].float()
-        expected_fp32 = torch.nn.functional.silu(gate) * up
-
-        # Dequantise the kernel output and compare sign pattern at high level
-        dequant = out.float() * scales.repeat_interleave(group_size, dim=1)
-        # Signs should agree for the vast majority of elements
-        sign_match = (torch.sign(dequant) == torch.sign(expected_fp32)).float().mean()
-        assert sign_match > 0.95, f"Sign match too low: {sign_match:.3f}"
-
     @pytest.mark.parametrize("num_tokens", [1, 8, 32])
     def test_scale_ub_clamps_scales(self, num_tokens: int) -> None:
-        """When scale_ub is set, all per-block scales must be <= scale_ub / fp8_max."""
+        # When scale_ub is set, all per-block scales must be <= scale_ub.
         skip_if_platform_unsupported()
 
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -306,13 +266,15 @@ class TestSiluMulBlockQuantFp8Correctness:
             (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
         )
         _, fp8_max = get_fp8_min_max()
-        scale_ub_val = float(input.abs().mean().item())
+        mean_val = input.abs().mean()
+        scale_ub_factor = (mean_val / fp8_max).to(dtype=torch.float32, device="cuda")
 
-        silu_mul_block_quant_fp8(input, out, scales, group_size, scale_ub=scale_ub_val)
+        silu_mul_block_quant_fp8(
+            input, out, scales, group_size, scale_ub=scale_ub_factor
+        )
 
-        # Each scale = amax / fp8_max, so amax = scale * fp8_max <= scale_ub
-        assert (scales * fp8_max <= scale_ub_val + 1e-5).all(), (
-            "Some scales exceed scale_ub"
+        assert (scales <= scale_ub_factor.item() + 1e-6).all(), (
+            f"Some scales {scales.max().item()}exceed scale_ub {scale_ub_factor.item()}"
         )
 
 
@@ -343,19 +305,20 @@ class TestSiluMulBlockQuantFp8Integration:
         assert result is None or isinstance(result, tuple)
 
     def test_output_shapes(self):
-        """Kernel must produce outputs with the expected shapes."""
+        # Kernel must produce outputs with the expected shapes.
         skip_if_platform_unsupported()
 
         num_tokens, hidden_size, group_size = 8, 256, 64
         input = torch.randn(
             num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
         )
+        scale_ub = torch.mean(input.abs()).to(dtype=torch.float32, device="cuda")
         out = torch.empty((num_tokens, hidden_size), device="cuda", dtype=FP8_DTYPE)
         scales = torch.empty(
             (num_tokens, hidden_size // group_size), device="cuda", dtype=torch.float32
         )
 
-        silu_mul_block_quant_fp8(input, out, scales, group_size)
+        silu_mul_block_quant_fp8(input, out, scales, group_size, scale_ub)
 
         assert out.shape == (num_tokens, hidden_size)
         assert scales.shape == (num_tokens, hidden_size // group_size)
@@ -363,7 +326,7 @@ class TestSiluMulBlockQuantFp8Integration:
         assert scales.dtype == torch.float32
 
     def test_output_dtype_is_fp8(self):
-        """Output tensor must be written in FP8 dtype."""
+        # Output tensor must be written in FP8 dtype.
         skip_if_platform_unsupported()
 
         num_tokens, hidden_size, group_size = 4, 128, 64

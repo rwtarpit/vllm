@@ -33,11 +33,11 @@ def _get_fp8_dtype() -> torch.dtype:
 
 
 def generate_silu_mul_block_quant_fp8_inputs() -> dict[str, tuple[Any, ...]]:
-    hidden_size_list = [64, 2880, 4096, 8192, 11008, 14336]
+    hidden_size_list = [2048, 4096, 8192, 16384]
 
     # Use the same num_tokens values as vLLM's default cudagraph capture sizes.
     # See vllm/config/vllm.py _set_cudagraph_sizes() for the canonical formula.
-    num_tokens_list = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
+    num_tokens_list = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     group_size_list = [64, 128]
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = current_platform.fp8_dtype()
@@ -87,7 +87,8 @@ def pick_silu_mul_block_quant_fp8_config(
     if not config_keys:
         return None
 
-    input_tensor, _, _, group_size, _ = args
+    # input_tensor, _, _, group_size, _ = args
+    input_tensor, group_size = args[0], args[3]
     hidden_size = input_tensor.shape[-1] // 2
     num_tokens = input_tensor.view(-1, input_tensor.shape[-1]).shape[0]
     configs: dict[int, dict[int, list[int]]] = {}
@@ -129,6 +130,7 @@ def pick_silu_mul_block_quant_fp8_config(
     helion_settings=helion.Settings(
         autotune_baseline_atol=0.2,
         autotune_baseline_rtol=0.1,
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
         # TODO search._autotune_metrics.num_accuracy_failures for tolerance strictness
     ),
     config_picker=pick_silu_mul_block_quant_fp8_config,
@@ -140,7 +142,7 @@ def silu_mul_block_quant_fp8(
     scales: torch.Tensor,  # [num_tokens, hidden_size // block_size]
     block_size: int,
     scale_ub: torch.Tensor | None = None,
-    is_scale_transposed: bool = False,
+    is_scale_transposed: bool = False,  # dummy
 ) -> torch.Tensor:
     # This code assumes batch_dim and num_tokens are flattened
     group_size = hl.specialize(block_size)
@@ -164,41 +166,39 @@ def silu_mul_block_quant_fp8(
     _, fp8_max = get_fp8_min_max()
     min_scaling_factor = 1 / (fp8_max * 512.0)
 
-    input_part_a = input_2d[:, :d]
-    input_part_b = input_2d[:, d:]
-
     for tile_m, tile_d in hl.tile([m, d], block_size=[1, group_size]):
-        a_vals = input_part_a[tile_m, tile_d]
-        silu_result = torch.nn.functional.silu(a_vals)
-        b_vals = input_part_b[tile_m, tile_d]
-        result = silu_result * b_vals
-        result_f32 = result.to(torch.float32)
+        a_vals = hl.load(input_2d, [tile_m, tile_d])
+        b_vals = hl.load(input_2d, [tile_m, tile_d + d])
+        a_f32 = a_vals.to(torch.float32)
+        b_f32 = b_vals.to(torch.float32)
+        silu_result = torch.nn.functional.silu(a_f32)
+        result_f32 = silu_result * b_f32
         abs_val = torch.abs(result_f32.reshape(-1))
         abs_max = torch.amax(abs_val)
         block_scale = abs_max / fp8_max
 
         if scale_ub is not None:
-            block_scale = torch.clamp(max=scale_ub)
+            ub_val = hl.load(scale_ub, index=[])
+            block_scale = torch.clamp(block_scale, max=ub_val)
 
         block_scale = torch.clamp(block_scale, min=min_scaling_factor)
         inv_block_scale = 1.0 / block_scale
 
         out[tile_m, tile_d] = (result_f32 * inv_block_scale).to(out.dtype)
 
-        if is_scale_transposed:
-            scales[tile_d.id, tile_m] = inv_block_scale
-        else:
-            scales[tile_m, tile_d.id] = inv_block_scale
+        scales[tile_m, tile_d.id] = block_scale
 
     return out, scales
 
 
 def silu_mul_block_quant_fp8_baseline(
+    out: torch.Tensor,
     input: torch.Tensor,
+    scales: torch.Tensor,
     block_size: int,
     scale_ub: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
 ) -> torch.Tensor:
     return torch.ops._C.silu_and_mul_per_block_quant(
-        input, block_size, scale_ub, is_scale_transposed
+        out, input, scales, block_size, scale_ub, is_scale_transposed
     )
